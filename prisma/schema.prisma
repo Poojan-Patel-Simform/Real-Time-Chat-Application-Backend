@@ -1,0 +1,81 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  NON_BINARY
+  PREFER_NOT_TO_SAY
+}
+
+enum TokenType {
+  REFRESH
+  RESET_PASSWORD
+  EMAIL_VERIFY
+}
+
+
+model User {
+  id                  String    @id @default(uuid()) @db.Uuid
+  email               String    @unique @db.VarChar(255)
+  password_hash       String    @db.VarChar(255)
+  is_profile_complete Boolean   @default(false)
+
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+
+  profile             Profile?
+  tokens              Token[]
+
+  @@map("users")
+}
+
+model Profile {
+  id           String    @id @default(uuid()) @db.Uuid
+
+  user_id      String    @unique @db.Uuid
+  user         User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  username     String    @unique @db.VarChar(30)
+  display_name String    @db.VarChar(80)
+  bio          String?   @db.VarChar(300)
+  avatar_url   String?   @db.VarChar(512)
+
+  dob          DateTime  @db.Date
+  gender       Gender    @default(PREFER_NOT_TO_SAY)
+
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+
+  @@map("profiles")
+}
+
+model Token {
+  id          String    @id @default(uuid()) @db.Uuid
+  
+  user_id     String    @db.Uuid
+  user        User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  type        TokenType
+  token_hash  String    @db.VarChar(255)
+  expires_at  DateTime
+  is_used     Boolean   @default(false)
+
+ 
+  created_at  DateTime  @default(now())
+
+  @@index([user_id])
+  @@index([token_hash])       
+  @@index([type, expires_at]) 
+  @@map("tokens")
+}
