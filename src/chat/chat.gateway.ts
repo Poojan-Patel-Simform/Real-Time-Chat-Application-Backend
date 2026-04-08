@@ -16,6 +16,7 @@ import { PrismaService } from '../prisma.service.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { DeleteMessageDto } from './dto/delete-message.dto.js';
 import { GetMessagesDto } from './dto/get-messages.dto.js';
+import { TypingDto } from './dto/typing.dto.js';
 import { DeletedFor } from '../generated/prisma/enums.js';
 import type { JwtPayload } from '../common/guards/jwt-auth.guard.js';
 
@@ -30,6 +31,13 @@ const PERSONAL_ROOM = (userId: string) => `user:${userId}`;
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   private readonly server: Server;
+
+  /** key: `senderId:receiverId` → auto-stop timer handle */
+  private readonly typingTimers = new Map<string, NodeJS.Timeout>();
+
+  private typingKey(senderId: string, receiverId: string): string {
+    return `${senderId}:${receiverId}`;
+  }
 
   constructor(
     private readonly chatService: ChatService,
@@ -61,8 +69,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client.data.user = payload;
 
     // Insert presence row
-    await this.prisma.userPresence.create({
-      data: {
+
+    await this.prisma.userPresence.upsert({
+      where: {
+        socket_id: client.id,
+      },
+      update: {},
+      create: {
         user_id: payload.sub,
         socket_id: client.id,
       },
@@ -93,6 +106,72 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (remaining === 0) {
       this.server.emit('user:offline', { userId });
     }
+
+    // Cancel any dangling typing timers for this user
+    for (const key of this.typingTimers.keys()) {
+      if (key.startsWith(`${userId}:`)) {
+        clearTimeout(this.typingTimers.get(key));
+        this.typingTimers.delete(key);
+      }
+    }
+  }
+
+  // ─── Typing indicators ────────────────────────────────────────────────────
+
+  @SubscribeMessage('typing:start')
+  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
+  async handleTypingStart(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() dto: TypingDto,
+  ) {
+    const senderId: string = client.data.user?.sub;
+    if (!senderId) return;
+
+    if (await this.chatService.isBlocked(senderId, dto.receiverId)) return;
+
+    const key = this.typingKey(senderId, dto.receiverId);
+
+    // Reset existing auto-stop timer if present
+    if (this.typingTimers.has(key)) {
+      clearTimeout(this.typingTimers.get(key));
+    }
+
+    this.server
+      .to(PERSONAL_ROOM(dto.receiverId))
+      .emit('typing:start', { senderId });
+
+    // Auto-stop after 5 s in case the client forgets to send typing:stop
+    const timer = setTimeout(() => {
+      this.typingTimers.delete(key);
+      this.server
+        .to(PERSONAL_ROOM(dto.receiverId))
+        .emit('typing:stop', { senderId });
+    }, 5000);
+
+    this.typingTimers.set(key, timer);
+  }
+
+  @SubscribeMessage('typing:stop')
+  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
+  async handleTypingStop(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() dto: TypingDto,
+  ) {
+    const senderId: string = client.data.user?.sub;
+    if (!senderId) return;
+
+    if (await this.chatService.isBlocked(senderId, dto.receiverId)) return;
+
+    const key = this.typingKey(senderId, dto.receiverId);
+
+    if (this.typingTimers.has(key)) {
+      clearTimeout(this.typingTimers.get(key));
+      this.typingTimers.delete(key);
+    }
+
+    this.server
+      .to(PERSONAL_ROOM(dto.receiverId))
+      .emit('typing:stop', { senderId });
   }
 
   // ─── Send message ──────────────────────────────────────────────────────────

@@ -16,7 +16,7 @@ export class ChatService {
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
   /** Check if either party has blocked the other. Returns true if blocked. */
-  private async isBlocked(userA: string, userB: string): Promise<boolean> {
+  async isBlocked(userA: string, userB: string): Promise<boolean> {
     const block = await this.prisma.block.findFirst({
       where: {
         OR: [
