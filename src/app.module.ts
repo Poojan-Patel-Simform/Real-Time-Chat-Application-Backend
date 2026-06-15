@@ -8,6 +8,7 @@ import { ProfileModule } from './profile/profile.module.js';
 import { UsersModule } from './users/users.module.js';
 import { ChatModule } from './chat/chat.module.js';
 import { PresenceModule } from './presence/presence.module.js';
+import { NotificationModule } from './notification/notification.module.js';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { PresenceModule } from './presence/presence.module.js';
     UsersModule,
     ChatModule,
     PresenceModule,
+    NotificationModule,
   ],
   controllers: [AppController],
   providers: [AppService],

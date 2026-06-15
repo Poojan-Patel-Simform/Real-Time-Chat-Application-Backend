@@ -13,6 +13,7 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { ChatService } from './chat.service.js';
 import { PrismaService } from '../prisma.service.js';
+import { NotificationService } from '../notification/notification.service.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { DeleteMessageDto } from './dto/delete-message.dto.js';
 import { GetMessagesDto } from './dto/get-messages.dto.js';
@@ -44,6 +45,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly notificationService: NotificationService,
   ) {}
 
   // ─── Connection ────────────────────────────────────────────────────────────
@@ -83,6 +85,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Join personal room for targeted message delivery
     await client.join(PERSONAL_ROOM(payload.sub));
+
+    // Send the current unread count to this socket only
+    const count = await this.notificationService.getUnreadCount(payload.sub);
+    client.emit('notification:count', { count });
 
     // Notify all others that this user is online
     client.broadcast.emit('user:online', { userId: payload.sub });
@@ -196,6 +202,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         .to(PERSONAL_ROOM(dto.receiverId))
         .emit('message:new', message);
 
+      // Push updated unread count to the receiver
+      const count = await this.notificationService.getUnreadCount(
+        dto.receiverId,
+      );
+      this.server
+        .to(PERSONAL_ROOM(dto.receiverId))
+        .emit('notification:count', { count });
+
       // Confirm back to sender
       client.emit('message:new', message);
     } catch (err: any) {
@@ -245,7 +259,24 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         status: updated.status,
         read_at: updated.read_at,
       });
+
+      // Update the reader's unread count
+      const count = await this.notificationService.getUnreadCount(receiverId);
+      this.server
+        .to(PERSONAL_ROOM(receiverId))
+        .emit('notification:count', { count });
     }
+  }
+
+  // ─── Mark all notifications read ───────────────────────────────────────────
+
+  @SubscribeMessage('notification:read-all')
+  async handleReadAllNotifications(@ConnectedSocket() client: Socket) {
+    const userId: string = client.data.user?.sub;
+    if (!userId) return;
+
+    await this.notificationService.markAllRead(userId);
+    client.emit('notification:count', { count: 0 });
   }
 
   // ─── Load messages (reverse infinite scroll) ───────────────────────────────
