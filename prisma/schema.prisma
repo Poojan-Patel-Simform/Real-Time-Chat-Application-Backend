@@ -1,0 +1,237 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  NON_BINARY
+  PREFER_NOT_TO_SAY
+}
+
+enum TokenType {
+  REFRESH
+  RESET_PASSWORD
+  EMAIL_VERIFY
+}
+
+enum MessageStatus {
+  SENT
+  DELIVERED
+  READ
+}
+
+enum DeletedFor {
+  NONE     // visible to both (default)
+  SENDER   // sender deleted for themselves
+  RECEIVER // receiver deleted for themselves
+  BOTH     // deleted for everyone
+}
+
+
+model User {
+  id                  String   @id @default(uuid()) @db.Uuid
+  email               String   @unique @db.VarChar(255)
+  password_hash       String   @db.VarChar(255)
+  is_email_verified   Boolean  @default(false)
+  is_profile_complete Boolean  @default(false)
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Auth
+  profile Profile?
+  tokens  Token[]
+
+  // Messaging
+  sent_messages     Message[] @relation("SentMessages")
+  received_messages Message[] @relation("ReceivedMessages")
+
+  // Blocking
+  blocked_by_me   Block[] @relation("BlockedByMe")   // rows where I am the blocker
+  blocked_by_receiver Block[] @relation("BlockedByReceiver")  // rows where I am the blocked
+
+  // Presence — one row per active socket connection.
+  // A user is "online" if they have at least one presence row.
+  // Multiple tabs / devices = multiple rows, all cleaned up on disconnect.
+  presence UserPresence[]
+
+  @@map("users")
+}
+
+// ============================================================
+// PROFILE  
+// ============================================================
+
+model Profile {
+  id           String   @id @default(uuid()) @db.Uuid
+  user_id      String   @unique @db.Uuid
+  user         User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  username     String   @unique @db.VarChar(30)
+  display_name String   @db.VarChar(80)
+  bio          String?  @db.VarChar(300)
+  avatar_url   String?  @db.VarChar(512)
+  dob          DateTime @db.Date
+  gender       Gender   @default(PREFER_NOT_TO_SAY)
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  @@map("profiles")
+}
+
+// ============================================================
+// TOKEN  
+// ============================================================
+
+model Token {
+  id         String    @id @default(uuid()) @db.Uuid
+  user_id    String    @db.Uuid
+  user       User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  type       TokenType
+  token_hash String    @db.VarChar(255)
+  expires_at DateTime
+  is_used    Boolean   @default(false)
+  created_at DateTime  @default(now())
+
+  @@index([user_id])
+  @@index([token_hash])
+  @@index([type, expires_at])
+  @@map("tokens")
+}
+
+// ============================================================
+// BLOCK
+// Symmetric check required — before sending a message, query:
+//   WHERE (blocker_id = senderId AND blocked_id = receiverId)
+//      OR (blocker_id = receiverId AND blocked_id = senderId)
+// If any row exists, reject the send.
+// ============================================================
+
+model Block {
+  id         String   @id @default(uuid()) @db.Uuid
+
+  blocker_id String   @db.Uuid
+  blocker    User     @relation("BlockedByMe",  fields: [blocker_id], references: [id], onDelete: Cascade)
+
+  blocked_id String   @db.Uuid
+  blocked    User     @relation("BlockedByReceiver", fields: [blocked_id], references: [id], onDelete: Cascade)
+
+  created_at DateTime @default(now())
+
+  // A user can only block another user once
+  @@unique([blocker_id, blocked_id])
+
+  // Fast lookup: "has user X blocked user Y?"
+  @@index([blocker_id, blocked_id])
+
+  // Fast lookup: "who has blocked user X?" (for their user list view)
+  @@index([blocked_id])
+
+  @@map("blocks")
+}
+
+// ============================================================
+// MESSAGE
+// Direct message between two users.
+//
+// Pagination strategy — cursor-based using created_at:
+//   First load:  ORDER BY created_at DESC LIMIT 25
+//   Next page:   WHERE created_at < :cursor ORDER BY created_at DESC LIMIT 25
+//   Reverse the result array before rendering (oldest at top).
+//
+// Delete strategy — soft delete only, never hard delete.
+//   "Delete for me"   → update deleted_for to SENDER or RECEIVER
+//   "Delete for both" → update deleted_for to BOTH
+//   Query filter:
+//     sender   sees messages WHERE deleted_for NOT IN (SENDER, BOTH)
+//     receiver sees messages WHERE deleted_for NOT IN (RECEIVER, BOTH)
+// ============================================================
+
+model Message {
+  id          String        @id @default(uuid()) @db.Uuid
+
+  sender_id   String        @db.Uuid
+  sender      User          @relation("SentMessages",     fields: [sender_id],   references: [id])
+
+  receiver_id String        @db.Uuid
+  receiver    User          @relation("ReceivedMessages", fields: [receiver_id], references: [id])
+
+  content     String        @db.Text
+
+  // Delivery receipt — updated by the Socket.io gateway
+  status      MessageStatus @default(SENT)
+
+  // Soft-delete visibility control
+  deleted_for DeletedFor    @default(NONE)
+
+  // Timestamp when receiver triggered READ status
+  read_at     DateTime?
+
+  created_at  DateTime      @default(now())
+  updated_at  DateTime      @updatedAt
+
+  // Paginated sent history for one user
+  @@index([sender_id,   created_at])
+
+  // Paginated inbox for one user
+  @@index([receiver_id, created_at])
+
+  // Core conversation query (covers both directions):
+  //   WHERE (sender_id = A AND receiver_id = B)
+  //      OR (sender_id = B AND receiver_id = A)
+  //   ORDER BY created_at DESC LIMIT 25
+  @@index([sender_id, receiver_id, created_at])
+
+  // Unread count badge:
+  //   WHERE receiver_id = me AND status != READ
+  @@index([receiver_id, status])
+
+  @@map("messages")
+}
+
+// ============================================================
+// USER PRESENCE
+// One row per active Socket.io connection.
+// Inserted on connect, deleted on disconnect.
+//
+// Why a DB table instead of Redis-only:
+//   - JOIN-able in the user-list query (online flag in one round-trip)
+//   - Survives a Redis flush / restart
+//   - Redis is still used for pub/sub between NestJS instances
+//
+// Online check:  SELECT COUNT(*) WHERE user_id = X  →  > 0 means online
+// User list:     LEFT JOIN user_presence ON users.id = user_presence.user_id
+//                GROUP BY users.id → COUNT(presence.id) > 0 means online
+//
+// Stale row cleanup (safety net for crashed sockets):
+//   Run every 60s:  DELETE WHERE last_seen < NOW() - INTERVAL '2 minutes'
+// ============================================================
+
+model UserPresence {
+  id           String   @id @default(uuid()) @db.Uuid
+
+  user_id      String   @db.Uuid
+  user         User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  // Socket.io socket ID — used to delete the exact row on disconnect
+  socket_id    String   @unique @db.VarChar(100)
+
+  // Refreshed by a client-side heartbeat ping every 30 seconds
+  last_seen    DateTime @default(now()) @updatedAt
+
+  connected_at DateTime @default(now())
+
+  @@index([user_id])
+  @@index([last_seen]) // used by the stale-row cleanup cron
+  @@map("user_presence")
+}
